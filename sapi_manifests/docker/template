@@ -52,15 +52,27 @@
     "cnapi": {
         "url": "http://cnapi.{{{datacenter_name}}}.{{{dns_domain}}}"
     },
+    {{#CNS_SERVICE}}
+    "cns": {
+        "url": "http://{{{cns_domain}}}"
+    },
+    {{/CNS_SERVICE}}
     "wfapi": {
         "forceMd5Check": true,
-        "workflows": ["pull-image"],
+        "workflows": ["pull-image-v2"],
         "url": "http://workflow.{{{datacenter_name}}}.{{{dns_domain}}}"
     },
-
+{{#experimental_docker_nfs_shared_volumes}}
+    "volapi": {
+        "url": "http://volapi.{{{datacenter_name}}}.{{{dns_domain}}}"
+    },
+{{/experimental_docker_nfs_shared_volumes}}
     "httpProxy": "{{{http_proxy}}}",
     "dockerRegistryInsecure": {{^docker_registry_insecure}}false{{/docker_registry_insecure}}{{#docker_registry_insecure}}{{{docker_registry_insecure}}}{{/docker_registry_insecure}},
 
+    {{#DOCKER_USE_CONN_WATCHER}}
+    "useConnectionStatusWatcher": true,
+    {{/DOCKER_USE_CONN_WATCHER}}
     "useTls": {{^USE_TLS}}false{{/USE_TLS}}{{#USE_TLS}}{{{USE_TLS}}}{{/USE_TLS}},
     "tls": {
         "requestCert": true,
@@ -77,10 +89,19 @@
 {{#experimental_fluentd_host}}
     "fluentd_host": "{{{experimental_fluentd_host}}}",
 {{/experimental_fluentd_host}}
-
+{{#experimental_docker_nfs_shared_volumes}}
+    "experimental_docker_nfs_shared_volumes": {{{experimental_docker_nfs_shared_volumes}}},
+{{/experimental_docker_nfs_shared_volumes}}
+{{#experimental_docker_automount_nfs_shared_volumes}}
+    "experimental_docker_automount_nfs_shared_volumes": {{{experimental_docker_automount_nfs_shared_volumes}}},
+{{/experimental_docker_automount_nfs_shared_volumes}}
 {{#FWRULE_VERSION}}
     "fwrule_version": {{{FWRULE_VERSION}}},
 {{/FWRULE_VERSION}}
+
+{{#DOCKER_PLUGINS}}
+    "plugins": {{{DOCKER_PLUGINS}}},
+{{/DOCKER_PLUGINS}}
 
     "ufds": {
         "url": "ldaps://{{{ufds_domain}}}",

@@ -5,13 +5,14 @@
  */
 
 /*
- * Copyright 2016, Joyent, Inc.
+ * Copyright 2017, Joyent, Inc.
  */
 
 /*
  * Integration tests for `docker create` using the Remote API directly.
  */
 
+var assert = require('assert-plus');
 var exec = require('child_process').exec;
 var format = require('util').format;
 var libuuid = require('libuuid');
@@ -31,6 +32,7 @@ var BYTES_IN_MB = 1024 * 1024;
 var ALICE;
 var BOB;
 var DOCKER_ALICE;
+var DOCKER_ALICE_HTTP; // For sending non-JSON payload
 var DOCKER_BOB;
 var STATE = {
     log: require('../lib/log')
@@ -75,11 +77,20 @@ test('setup', function (tt) {
                         return done(err, client);
                     }
                 );
+            },
+            function createAliceHttp(done) {
+                h.createDockerRemoteClient({user: ALICE, clientType: 'http'},
+                    function (err, client) {
+                        t.ifErr(err, 'docker client init for alice/http');
+                        done(err, client);
+                    }
+                );
             }
         ]}, function allDone(err, results) {
             t.ifError(err, 'docker client init should be successful');
             DOCKER_ALICE = results.operations[0].result;
             DOCKER_BOB = results.operations[1].result;
+            DOCKER_ALICE_HTTP = results.operations[2].result;
             t.end();
         });
     });
@@ -100,6 +111,16 @@ test('setup', function (tt) {
             NAPI = client;
             t.end();
         });
+    });
+
+    tt.test('check if fabrics are enabled', function (t) {
+        h.isFabricNetworkingEnabled(NAPI, ALICE.account,
+            function (err, enabled) {
+                t.ifErr(err, 'check isFabricNetworkingEnabled');
+                FABRICS = enabled;
+                t.end();
+            }
+        );
     });
 
     tt.test('pull nginx image', function (t) {
@@ -323,7 +344,7 @@ test('api: create', function (tt) {
 });
 
 
-test('api: create with env var that has no value (DOCKER-741)', function (tt) {
+test('api: test DOCKER-741 and DOCKER-898', function (tt) {
     tt.test('create empty-env-var container', function (t) {
         h.createDockerContainer({
             vmapiClient: VMAPI,
@@ -336,7 +357,40 @@ test('api: create with env var that has no value (DOCKER-741)', function (tt) {
         function oncreate(err, result) {
             t.ifErr(err, 'create empty-env-var container');
             t.equal(result.vm.state, 'running', 'Check container running');
-            DOCKER_ALICE.del('/containers/' + result.id + '?force=1', ondelete);
+
+            if (err) {
+                t.end();
+                return;
+            }
+
+            checkForCnsDnsEntries(result);
+        }
+
+        function checkForCnsDnsEntries(result) {
+            // Get the resolv.conf from the container.
+            var opts = {
+                dockerHttpClient: DOCKER_ALICE_HTTP,
+                path: '/etc/resolv.conf',
+                vmId: result.id
+            };
+            h.getFileContentFromContainer(opts, function (err, contents) {
+                t.ifErr(err, 'Unable to fetch /etc/resolv.conf file');
+
+                if (err) {
+                    t.end();
+                    return;
+                }
+
+                var hasCnsSearch = contents.match(/^search\s.*?\.cns\./m);
+                t.ok(hasCnsSearch, 'find cns entry in /etc/resolv.conf');
+                if (!hasCnsSearch) {
+                    t.fail('cns not found in /etc/resolv.conf file contents: '
+                        + contents);
+                }
+
+                DOCKER_ALICE.del('/containers/' + result.id + '?force=1',
+                    ondelete);
+            });
         }
 
         function ondelete(err) {
@@ -345,26 +399,6 @@ test('api: create with env var that has no value (DOCKER-741)', function (tt) {
         }
     });
 });
-
-test('ensure fabrics enabled', function (tt) {
-    tt.test('fabric configuration', function (t) {
-        var listOpts = {};
-        var listParams = {};
-        NAPI.listFabricVLANs(ALICE.account.uuid, listOpts, listParams,
-            function (err, vlans) {
-                if (err) {
-                    FABRICS = false;
-                    if (err.restCode !== 'PreconditionRequiredError') {
-                        t.ifErr(err);
-                    }
-                } else {
-                    FABRICS = true;
-                }
-                t.end();
-        });
-    });
-});
-
 
 /*
  * Tests for `docker run --net`
@@ -392,6 +426,7 @@ test('create with NetworkMode (docker run --net=)', function (tt) {
     var fNetwork1;
     var fNetwork2;
     var fNetwork3;
+    var nonFabricNetwork;
 
     if (!FABRICS) {
         tt.comment('Fabrics not enabled, skipping tests that require them.');
@@ -480,6 +515,9 @@ test('create with NetworkMode (docker run --net=)', function (tt) {
                 function fnw3(_, cb) {
                     h.getOrCreateFabricNetwork(NAPI, ALICE.account.uuid,
                         fVlan.vlan_id, nw3params, cb);
+                },
+                function fnonFabricNet(_, cb) {
+                    h.getNetwork(NAPI, {name: 'external'}, cb);
                 }
             ]
         }, function (err, results) {
@@ -491,6 +529,16 @@ test('create with NetworkMode (docker run --net=)', function (tt) {
             fNetwork1 = results.operations[0].result;
             fNetwork2 = results.operations[1].result;
             fNetwork3 = results.operations[2].result;
+            nonFabricNetwork = results.operations[3].result;
+
+            t.test('create pool', function (t2) {
+                h.getOrCreateNetworkPool(NAPI, 'sdcdockertest_apicreate_netp', {
+                    networks: [ nonFabricNetwork.uuid ]
+                }, function (err2) {
+                    t2.ifErr(err2, 'create pool failed');
+                    t2.end();
+                });
+            });
 
             t.end();
         });
@@ -519,6 +567,30 @@ test('create with NetworkMode (docker run --net=)', function (tt) {
         }
     });
 
+    // create with networkPool name
+    tt.test('create with a networkPool name', function (t) {
+        h.createDockerContainer({
+            vmapiClient: VMAPI,
+            dockerClient: DOCKER_ALICE,
+            test: t,
+            extra: { 'HostConfig.NetworkMode': 'sdcdockertest_apicreate_netp' },
+            start: true
+        }, oncreate);
+
+        function oncreate(err, result) {
+            t.ifErr(err, 'create NetworkPool: networkName');
+            var nics = result.vm.nics;
+            t.equal(nics[0].network_uuid, nonFabricNetwork.uuid,
+                'correct network');
+            DOCKER_ALICE.del('/containers/' + result.id + '?force=1', ondelete);
+        }
+
+        function ondelete(err) {
+            t.ifErr(err, 'delete network testing container');
+            t.end();
+        }
+    });
+
     tt.test('create with a complete network id', function (t) {
         var fullId = (fNetwork1.uuid + fNetwork1.uuid).replace(/-/g, '');
 
@@ -531,6 +603,7 @@ test('create with NetworkMode (docker run --net=)', function (tt) {
         }, oncreate);
 
         function oncreate(err, result) {
+            t.ifErr(err, 'create network testing container');
             var nics = result.vm.nics;
             t.equal(nics.length, 1, 'only one nic');
             t.equal(nics[0].network_uuid, fNetwork1.uuid, 'correct network');
@@ -556,9 +629,40 @@ test('create with NetworkMode (docker run --net=)', function (tt) {
         }, oncreate);
 
         function oncreate(err, result) {
+            t.ifErr(err, 'create network testing container');
             var nics = result.vm.nics;
             t.equal(nics.length, 1, 'only one nic');
             t.equal(nics[0].network_uuid, fNetwork1.uuid, 'correct network');
+            DOCKER_ALICE.del('/containers/' + result.id + '?force=1', ondelete);
+        }
+
+        function ondelete(err) {
+            t.ifErr(err, 'delete network testing container');
+            t.end();
+        }
+    });
+
+    tt.test('create with partial network id, publish ports', function (t) {
+        var partialId = (fNetwork1.uuid + fNetwork1.uuid).replace(/-/g, '');
+        partialId = partialId.substr(0, 10);
+
+        h.createDockerContainer({
+            vmapiClient: VMAPI,
+            dockerClient: DOCKER_ALICE,
+            test: t,
+            extra: {
+                'HostConfig.NetworkMode': partialId,
+                'HostConfig.PublishAllPorts': true
+            },
+            start: true
+        }, oncreate);
+
+        function oncreate(err, result) {
+            var nics = result.vm.nics;
+            t.equal(nics.length, 2, 'two nics');
+            t.equal(nics[0].network_uuid, fNetwork1.uuid, 'correct network');
+            t.equal(nics[1].network_uuid, nonFabricNetwork.uuid,
+                'correct network');
             DOCKER_ALICE.del('/containers/' + result.id + '?force=1', ondelete);
         }
 
@@ -618,12 +722,13 @@ test('create with NetworkMode (docker run --net=)', function (tt) {
     });
 
     tt.test('create with a network that doesn\'t exist', function (t) {
+        var uuid = libuuid.create();
         h.createDockerContainer({
             vmapiClient: VMAPI,
             dockerClient: DOCKER_ALICE,
             test: t,
-            extra: { 'HostConfig.NetworkMode': 'netmodefoobar' },
-            expectedErr: '(Error) network netmodefoobar not found',
+            extra: { 'HostConfig.NetworkMode': uuid },
+            expectedErr: '(Error) network ' + uuid + ' not found',
             start: true
         }, oncreate);
 
@@ -631,5 +736,260 @@ test('create with NetworkMode (docker run --net=)', function (tt) {
             t.ok(err, 'should err on create');
             t.end();
         }
+    });
+
+    tt.test('create without specifying network', function (t) {
+        h.createDockerContainer({
+            vmapiClient: VMAPI,
+            dockerClient: DOCKER_ALICE,
+            test: t,
+            start: true
+        }, oncreate);
+
+        function oncreate(err, result) {
+            var nics = result.vm.nics;
+            t.equal(nics.length, 1, 'only one nic');
+            h.getNetwork(NAPI, {uuid: nics[0].network_uuid},
+                function (err2, net) {
+
+                t.ifErr(err2, 'get network');
+                t.ok(net, 'nets exists');
+                if (net) {
+                    t.equal(net.name, 'My-Fabric-Network', 'correct network');
+                }
+                DOCKER_ALICE.del('/containers/' + result.id + '?force=1',
+                    ondelete);
+            });
+        }
+
+        function ondelete(err) {
+            t.ifErr(err, 'delete network testing container');
+            t.end();
+        }
+    });
+
+    tt.test('create without specifying network, publish ports', function (t) {
+        h.createDockerContainer({
+            vmapiClient: VMAPI,
+            dockerClient: DOCKER_ALICE,
+            test: t,
+            extra: {'HostConfig.PublishAllPorts': true},
+            start: true
+        }, oncreate);
+
+        function oncreate(err, result) {
+            var nics = result.vm.nics;
+            t.equal(nics.length, 2, 'only two nics');
+            t.equal(nics[1].network_uuid, nonFabricNetwork.uuid,
+                    'correct network');
+            h.getNetwork(NAPI, {uuid: nics[0].network_uuid},
+                function (err2, net) {
+
+                t.ifErr(err2, 'get network');
+                t.ok(net, 'nets exists');
+                if (net) {
+                    t.equal(net.name, 'My-Fabric-Network', 'correct network');
+                }
+                DOCKER_ALICE.del('/containers/' + result.id + '?force=1',
+                    ondelete);
+            });
+        }
+
+        function ondelete(err) {
+            t.ifErr(err, 'delete network testing container');
+            t.end();
+        }
+    });
+
+    tt.test('create with L3 nonFabric network', function (t) {
+        h.createDockerContainer({
+            vmapiClient: VMAPI,
+            dockerClient: DOCKER_ALICE,
+            test: t,
+            extra: { 'HostConfig.NetworkMode': nonFabricNetwork.name },
+            start: true
+        }, oncreate);
+
+        function oncreate(err, result) {
+            var nics = result.vm.nics;
+            t.equal(nics.length, 1, 'only one nic');
+            t.equal(nics[0].network_uuid, nonFabricNetwork.uuid,
+                'correct network');
+            DOCKER_ALICE.del('/containers/' + result.id + '?force=1', ondelete);
+        }
+
+        function ondelete(err) {
+            t.ifErr(err, 'delete network testing container');
+            t.end();
+        }
+    });
+
+    tt.test('create with L3 nonFabric network, publish ports', function (t) {
+        h.createDockerContainer({
+            vmapiClient: VMAPI,
+            dockerClient: DOCKER_ALICE,
+            test: t,
+            extra: {
+                'HostConfig.NetworkMode': nonFabricNetwork.name,
+                'HostConfig.PublishAllPorts': true
+            },
+            start: true
+        }, oncreate);
+
+        function oncreate(err, result) {
+            var nics = result.vm.nics;
+            t.equal(nics.length, 2, 'two nics');
+            t.equal(nics[0].network_uuid, nonFabricNetwork.uuid,
+                'correct network');
+            t.equal(nics[1].network_uuid, nonFabricNetwork.uuid,
+                'correct network');
+            DOCKER_ALICE.del('/containers/' + result.id + '?force=1', ondelete);
+        }
+
+        function ondelete(err) {
+            t.ifErr(err, 'delete network testing container');
+            t.end();
+        }
+    });
+
+    tt.test('fail to create with a network that doesn\'t exit, publish ports',
+        function (t) {
+
+        var uuid = libuuid.create();
+        h.createDockerContainer({
+            vmapiClient: VMAPI,
+            dockerClient: DOCKER_ALICE,
+            test: t,
+            extra: {
+                'HostConfig.NetworkMode': uuid,
+                'HostConfig.PublishAllPorts': true
+            },
+            start: false,
+            expectedErr: '(Error) network ' + uuid + ' not found'
+        }, oncreate);
+
+        function oncreate(err, result) {
+            t.ok(err, 'Expecting error');
+            t.end();
+        }
+    });
+});
+
+
+/*
+ * Tests for `docker run --label triton.network.public=foo`
+ *
+ * DOCKER-1020 Ensure we can provision to the external (public) network of our
+ * choice by setting the appropriate triton label.
+ */
+test('run external network (docker run --label triton.network.public=)',
+    function (tt) {
+
+    var externalNetwork;
+
+    tt.test('add external network', function (t) {
+        // create a new one.
+        var nwUuid = libuuid.create();
+        var nwParams = {
+            name: 'sdcdockertest_apicreate_external',
+            nic_tag: 'external',
+            subnet: '10.0.11.0/24',
+            provision_start_ip: '10.0.11.2',
+            provision_end_ip: '10.0.11.254',
+            uuid: nwUuid,
+            vlan_id: 5,
+            gateway: '10.0.11.1',
+            resolvers: ['8.8.8.8', '8.8.4.4']
+        };
+        h.getOrCreateExternalNetwork(NAPI, nwParams, function (err, network) {
+            t.ifErr(err, 'getOrCreateExternalNetwork');
+            externalNetwork = network;
+            t.end();
+        });
+    });
+
+    // Attempt a run with the external name, ensure the container is assigned
+    // the external network that was asked for.
+    tt.test('run with custom external network name', function (t) {
+        // DOCKER-1045: when FABRICS are enabled, we expect an error if
+        // specifying a specific external network, but are not publishing any
+        // ports.
+        var expectedErr = (FABRICS ? '(Validation) triton.network.public '
+            + 'label requires a container with published ports' : null);
+
+        h.createDockerContainer({
+            vmapiClient: VMAPI,
+            dockerClient: DOCKER_ALICE,
+            test: t,
+            expectedErr: expectedErr,
+            extra: { Labels: { 'triton.network.public': externalNetwork.name }},
+            start: true
+        }, oncreate);
+
+        function oncreate(err, result) {
+            if (FABRICS) {
+                // Note: Error is already checked in createDockerContainer.
+                assert.object(err, 'err');
+                t.end();
+                return;
+            }
+            var nics = result.vm.nics;
+            t.equal(nics.length, 1, 'only one nic');
+            t.equal(nics[0].network_uuid, externalNetwork.uuid,
+                'correct external network');
+            DOCKER_ALICE.del('/containers/' + result.id + '?force=1', ondelete);
+        }
+
+        function ondelete(err) {
+            t.ifErr(err, 'delete external network testing container');
+            t.end();
+        }
+    });
+
+    // Attempt a run with the external name whilst publishing ports, ensure the
+    // container is assigned the external network that was asked for.
+    tt.test('run custom external network name, published ports', function (t) {
+        h.createDockerContainer({
+            vmapiClient: VMAPI,
+            dockerClient: DOCKER_ALICE,
+            test: t,
+            extra: {
+                'HostConfig.PublishAllPorts': true,
+                Labels: { 'triton.network.public': externalNetwork.name }
+            },
+            start: true
+        }, oncreate);
+
+        function oncreate(err, result) {
+            var extNic;
+            var nics = result.vm.nics;
+            if (FABRICS) {
+                // Expect two nics, one fabric and one external.
+                t.equal(nics.length, 2, 'two nics');
+                extNic = (nics[0].nic_tag === 'external' ? nics[0] : nics[1]);
+            } else {
+                t.equal(nics.length, 1, 'one nic');
+                extNic = nics[0];
+            }
+            t.equal(extNic.network_uuid, externalNetwork.uuid,
+                'correct external network');
+            DOCKER_ALICE.del('/containers/' + result.id + '?force=1', ondelete);
+        }
+
+        function ondelete(err) {
+            t.ifErr(err, 'delete external network testing container');
+            t.end();
+        }
+    });
+
+    tt.test('external network cleanup', function (t) {
+        if (!externalNetwork) {
+            t.end();
+            return;
+        }
+        NAPI.deleteNetwork(externalNetwork.uuid, function (err) {
+            t.ifErr(err, 'external network deletion');
+            t.end();
+        });
     });
 });

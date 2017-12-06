@@ -79,14 +79,17 @@ function cliInspect(t, opts, callback) {
         var obj;
         var pe;
 
-        t.ifErr(err, 'docker inspect ' + opts.id);
-        t.equal(stderr, '', 'stderr should be empty');
-
-        // XXX: allow setting opts.expectedErr
         if (err) {
-            common.done(t, callback, err);
+            if (opts.expectedErr) {
+                common.expCliErr(t, stderr, opts.expectedErr, callback);
+            } else {
+                t.ifErr(err, 'docker inspect ' + opts.id);
+                common.done(t, callback, err);
+            }
             return;
         }
+
+        t.equal(stderr, '', 'stderr should be empty');
 
         if (!stdout) {
             var stdoutErr = new Error('no stdout!');
@@ -293,6 +296,36 @@ function cliRmAllCreated(t) {
 
 
 /**
+ * Removes all docker VMs that have the given name prefix.
+ */
+function cliRmContainersWithNamePrefix(tt, prefix) {
+    tt.test('remove old containers', function (t) {
+        cliPs(t, {args: '-a'}, function (err, entries) {
+            t.ifErr(err, 'docker ps');
+
+            var containersToRemove = entries.filter(function (entry) {
+                return (entry.names.substr(0, prefix.length) === prefix);
+            });
+
+            vasync.forEachParallel({
+                inputs: containersToRemove,
+                func: function _delOne(entry, cb) {
+                    cliRm(t, {args: '-f ' + entry.container_id}, onRemove);
+                    function onRemove(err2) {
+                        t.ifErr(err2, 'rm container ' + entry.container_id);
+                        cb(err2);
+                    }
+                }
+            }, function (forEachErr) {
+                tt.ifErr(forEachErr);
+                t.end();
+            });
+        });
+    });
+}
+
+
+/**
  * `docker create <cmd>`
  */
 function cliCreate(t, opts, callback) {
@@ -314,7 +347,16 @@ function cliCreate(t, opts, callback) {
 
             common.expCliErr(t, stderr, opts.expectedErr, callback);
             return;
+        } else if (opts.expectedClientErr) {
+            if (id) {
+                t.ok(false, 'expected error but got ID: ' + id);
+            }
 
+            t.ok(stderr && stderr.indexOf(opts.expectedClientErr) === 0,
+                'expected error message to be: ' + opts.expectedClientErr
+                    + ' and is: ' + stderr);
+            callback(stderr);
+            return;
         } else {
             t.ifErr(err, 'docker create');
             // Docker create may need to download the image, which produces
@@ -369,7 +411,7 @@ function cliRun(t, opts, callback) {
             common.expCliErr(t, stderr, opts.expectedErr, callback);
             return;
 
-        } else {
+        } else if (!opts.expectRuntimeError) {
             t.ifErr(err, 'docker run');
             // Docker run may need to download the image, which produces
             // stderr - only allow for that case:
@@ -451,7 +493,7 @@ function cliRm(t, opts, callback) {
         t.ifErr(err, 'docker rm ' + opts.args);
         t.equal(stderr, '', 'stderr');
 
-        callback(err);
+        common.done(t, callback, err);
     });
 }
 
@@ -465,9 +507,14 @@ function cliRmi(t, opts, callback) {
     assert.string(opts.args, 'opts.args');
 
     ALICE.docker('rmi ' + opts.args, function (err, stdout, stderr) {
+        if (opts.expectedErr) {
+            common.expCliErr(t, stderr, opts.expectedErr, callback);
+            return;
+        }
+
         t.ifErr(err, 'docker rmi ' + opts.args);
-        t.equal(stderr, '', 'stderr');
-        callback(err);
+        t.equal(stderr, '', 'docker rmi stderr should be empty');
+        common.done(t, callback, err);
     });
 }
 
@@ -499,7 +546,7 @@ function cliStart(t, opts, callback) {
     ALICE.docker('start ' + opts.args, function (err, stdout, stderr) {
         t.ifErr(err, 'docker start ' + opts.args);
         t.equal(stderr, '', 'stderr');
-        callback(err);
+        callback(err, stdout, stderr);
     });
 }
 
@@ -538,7 +585,6 @@ function cliCommit(t, opts, callback) {
         common.done(t, callback, err, id);
     });
 }
-
 
 /**
  * `docker attach <id>`
@@ -582,6 +628,7 @@ module.exports = {
     rm: cliRm,
     rmi: cliRmi,
     rmAllCreated: cliRmAllCreated,
+    rmContainersWithNamePrefix: cliRmContainersWithNamePrefix,
     run: cliRun,
     stop: cliStop,
     start: cliStart,

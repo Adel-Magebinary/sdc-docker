@@ -18,6 +18,7 @@ var difflet = require('difflet');
 var exec = require('child_process').exec;
 var fmt = require('util').format;
 var libuuid = require('libuuid');
+var tar = require('tar-stream');
 var VError = require('verror').VError;
 
 
@@ -184,14 +185,14 @@ function expErr(t, err, expected, isCliErr, callback) {
 
     var expectedErrRe = (isCliErr ? ERR_CLI_RE : ERR_API_RE);
     var matches = message.match(expectedErrRe);
-    if (!matches) {
-        t.ok(matches, fmt('err message does not match %s: %j',
-            expectedErrRe, message));
-        done(t, callback, new Error('unexpected error output'));
-        return;
+    if (matches) {
+        t.ok(matches[3], 'error req id: ' + matches[3]);
+        errorString = matches[2];
+    } else {
+        // Some messages (e.g. `docker inspect`) don't match the RE, so leave
+        // the error as is.
+        errorString = message;
     }
-    t.ok(matches[3], 'error req id: ' + matches[3]);
-    errorString = matches[2];
 
     if (RegExp.prototype.isPrototypeOf(expected)) {
         t.ok(expected.test(errorString),
@@ -280,7 +281,7 @@ function partialExp(t, opts, obj) {
 /*
  * Make a prefixed, randomized name for a test container.
  */
-function makeContainerName(prefix) {
+function makeResourceName(prefix) {
     return prefix + '-' + libuuid.create().split('-')[0];
 }
 
@@ -345,18 +346,110 @@ function parseOutputUsingHeader(stdout, opts) {
     return entries;
 }
 
+function parseDockerVersion(dockerVersionString) {
+    assert.string(dockerVersionString, 'dockerVersionString');
+
+    var dockerVersionRegExp = /^(\d+)\.(\d+)\.(\d+)(\-[a-z0-9]+)?$/;
+    var matches = dockerVersionString.match(dockerVersionRegExp);
+    var major, minor, patch, label;
+
+    if (!matches) {
+        return null;
+    }
+
+    major = Number(matches[1]);
+    minor = Number(matches[2]);
+    patch = Number(matches[3]);
+    label = matches[4];
+    if (label !== undefined) {
+        label = label.substr(1);
+    }
+
+    // major, minor and patch version info are mandatory, label is optional
+    if (isNaN(major) || isNaN(minor) || isNaN(patch)) {
+        return null;
+    }
+
+    return {
+        major: major,
+        minor: minor,
+        patch: patch,
+        label: label
+    };
+}
+
+/*
+ * Compares two strings "versionA" and "versionB" that represent a docker client
+ * version (e.g '1.9.1') and returns:
+ *
+ * - -1 if versionA < versionB
+ * - 0 if version A === version B
+ * - 1 if version A > version B
+ *
+ * A docker client version can have a "label" version. For instance, a docker
+ * client version of '1.9.1-somelabel' has the label 'somelabel'. These labels
+ * are not considered when comparing versions, so versions '1.9.1-foo' and
+ * '1.9.1-bar' will be considered to be the same.
+ */
+function dockerClientVersionCmp(versionA, versionB) {
+    assert.string(versionA, 'versionA');
+    assert.string(versionB, 'versionB');
+
+    var parsedVersionA = parseDockerVersion(versionA);
+    var parsedVersionB = parseDockerVersion(versionB);
+    var versionComponentA;
+    var versionComponentB;
+    var versionComponentIdx;
+    var versionComponentName;
+    var VERSION_COMPONENT_NAMES = ['major', 'minor', 'patch'];
+
+    if (versionA === versionB) {
+        return 0;
+    }
+
+    for (versionComponentIdx in VERSION_COMPONENT_NAMES) {
+        versionComponentName = VERSION_COMPONENT_NAMES[versionComponentIdx];
+
+        versionComponentA = parsedVersionA[versionComponentName];
+        versionComponentB = parsedVersionB[versionComponentName];
+
+        if (versionComponentA < versionComponentB) {
+            return -1;
+        } else if (versionComponentA > versionComponentB) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+function createTarStream(fileAndContents) {
+    var pack = tar.pack();
+
+    Object.keys(fileAndContents).forEach(function (name) {
+        pack.entry({name: name}, fileAndContents[name]);
+    });
+
+    pack.finalize();
+
+    return pack;
+}
+
 
 module.exports = {
     constants: constants,
+    createTarStream: createTarStream,
+    dockerClientVersionCmp: dockerClientVersionCmp,
     done: done,
     execPlus: execPlus,
     expected: expectedDeepEqual,
     expApiErr: expApiErr,
     expCliErr: expCliErr,
     ifErr: ifErr,
-    makeContainerName: makeContainerName,
-    makeImageName: makeImageName,
+    makeResourceName: makeResourceName,
     objCopy: objCopy,
+    parseDockerVersion: parseDockerVersion,
     parseOutputUsingHeader: parseOutputUsingHeader,
-    partialExp: partialExp
+    partialExp: partialExp,
+    parseDockerVersion: parseDockerVersion
 };

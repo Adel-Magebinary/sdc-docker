@@ -5,7 +5,7 @@
  */
 
 /*
- * Copyright (c) 2016, Joyent, Inc.
+ * Copyright (c) 2017, Joyent, Inc.
  */
 
 /*
@@ -13,19 +13,24 @@
  */
 
 var assert = require('assert-plus');
+var drc = require('docker-registry-client');
 var exec = require('child_process').exec;
 var fmt = require('util').format;
 var fs = require('fs');
-var mod_log = require('../lib/log');
+var moray = require('moray');
 var os = require('os');
 var path = require('path');
+var querystring = require('querystring');
 var sdcClients = require('sdc-clients');
 var restify = require('restify');
 var vasync = require('vasync');
 
 var common = require('../lib/common');
-var sdcCommon = require('../../lib/common');
+var configLoader = require('../../lib/config-loader.js');
 var constants = require('../../lib/constants');
+var mod_log = require('../lib/log');
+var sdcCommon = require('../../lib/common');
+var tar = require('tar-stream');
 
 
 // --- globals
@@ -36,7 +41,8 @@ var CONFIG = {
     papi_url: process.env.PAPI_URL,
     sapi_url: process.env.SAPI_URL,
     vmapi_url: process.env.VMAPI_URL,
-    napi_url: process.env.NAPI_URL
+    napi_url: process.env.NAPI_URL,
+    volapi_url: process.env.VOLAPI_URL
 };
 var p = console.error;
 var UA = 'sdcdockertest';
@@ -70,6 +76,7 @@ var CLIENT_ZONE_PAYLOAD = {
     ]
 };
 
+var FABRICS_ENABLED = null;
 
 
 // --- internal support routines
@@ -779,6 +786,26 @@ GzDockerEnv.prototype.exec = function denvExec(cmd, opts, cb) {
 
 
 /*
+ * Run '$cmd' in the global zone (Gz).
+ *
+ * @param cmd {String} The command to run.
+ * @param opts {Object} Optional: {log: Logger}
+ * @param callback {Function} `function (err, stdout, stderr)`
+ */
+GzDockerEnv.prototype.execGz = function execGz(cmd, opts, callback) {
+    assert.string(cmd, 'cmd');
+    assert.object(opts, 'opts');
+    assert.optionalObject(opts.log, 'opts.log');
+    assert.func(callback, 'callback');
+
+    common.execPlus({
+        command: cmd,
+        log: opts.log
+    }, callback);
+};
+
+
+/*
  * --- LocalDockerEnv
  *
  * A wrapper object for running docker client stuff as a particular account.
@@ -952,6 +979,28 @@ LocalDockerEnv.prototype.exec = function ldenvExec(cmd, opts, cb) {
 };
 
 
+/*
+ * Run '$cmd' in the global zone (Gz).
+ *
+ * @param cmd {String} The command to run.
+ * @param opts {Object} Optional: {log: Logger}
+ * @param callback {Function} `function (err, stdout, stderr)`
+ */
+LocalDockerEnv.prototype.execGz = function ldenvExecGz(cmd, opts, callback) {
+    assert.string(cmd, 'cmd');
+    assert.object(opts, 'opts');
+    assert.string(opts.headnodeSsh, 'opts.headnodeSsh');
+    assert.optionalObject(opts.log, 'opts.log');
+    assert.func(callback, 'callback');
+
+    var sshCmd = fmt('ssh %s %s', opts.headnodeSsh, cmd);
+
+    common.execPlus({
+        command: sshCmd,
+        log: opts.log
+    }, callback);
+};
+
 
 /*
  * --- Test helper functions
@@ -985,20 +1034,19 @@ function initDockerEnv(t, state, opts, cb) {
     assert.object(opts, 'opts');
     assert.func(cb, 'cb');
 
-    // if account does not have approved_for_provisioning set to val, set it
-    function setProvisioning(env, val, next) {
+    // If account does not have 'attr' set to 'val', then make it so.
+    function setAccountAttribute(env, attr, val, next) {
         assert.object(env, 'env');
         assert.bool(val, 'val');
         assert.func(next, 'next');
 
-        if (env.account.approved_for_provisioning === '' + val) {
+        if (env.account[attr] === '' + val) {
             next(null);
             return;
         }
 
-        var s = '/opt/smartdc/bin/sdc sdc-useradm replace-attr %s \
-            approved_for_provisioning %s';
-        var cmd = fmt(s, env.login, val);
+        var cmd = fmt('/opt/smartdc/bin/sdc sdc-useradm replace-attr %s %s %s',
+            env.login, attr, val);
 
         if (env.state.runningFrom === 'remote') {
             cmd = 'ssh ' + env.state.headnodeSsh + ' ' + cmd;
@@ -1012,6 +1060,15 @@ function initDockerEnv(t, state, opts, cb) {
         t.ifErr(err, 'docker env: alice');
         t.ok(alice, 'have a DockerEnv for alice');
 
+        setAccountAttribute(alice, 'triton_cns_enabled', true,
+            function (err2) {
+
+            t.ifErr(err2, 'docker env: alice set triton_cns_enabled true');
+            setupBob(alice);
+        });
+    });
+
+    function setupBob(alice) {
         // We create Bob here, who is permanently set as unprovisionable
         // below. Docker's ufds client caches account values, so mutating
         // Alice isn't in the cards (nor is Bob -- which is why we don't
@@ -1021,7 +1078,9 @@ function initDockerEnv(t, state, opts, cb) {
             t.ifErr(err2, 'docker env: bob');
             t.ok(bob, 'have a DockerEnv for bob');
 
-            setProvisioning(bob, false, function (err3) {
+            setAccountAttribute(bob, 'approved_for_provisioning', false,
+                function (err3) {
+
                 t.ifErr(err3, 'set bob unprovisionable');
 
                 var accounts = {
@@ -1033,7 +1092,7 @@ function initDockerEnv(t, state, opts, cb) {
                 return;
             });
         });
-    });
+    }
 }
 
 /*
@@ -1256,6 +1315,24 @@ function createNapiClient(callback) {
 }
 
 /**
+ * Get a simple restify JSON client to VOLAPI.
+ */
+function createVolapiClient(callback) {
+    assert.func(callback, 'callback');
+
+    createClientOpts('volapi', function (err, opts) {
+        if (err) {
+            return callback(err);
+        }
+
+        opts.userAgent = 'sdc-docker-integration-tests';
+
+        callback(null, new sdcClients.VOLAPI(opts));
+        return;
+    });
+}
+
+/**
  * Test the given Docker 'info' API response.
  */
 function assertInfo(t, info) {
@@ -1335,9 +1412,6 @@ function buildDockerContainer(opts, callback) {
 
             res.on('end', function onEnd() {
                 removeDockerTarStreamListeners();
-                if (err) {
-                    log.error({err: err}, 'error at end of result');
-                }
                 return callback(err, buildResult);
             });
         });
@@ -1365,6 +1439,75 @@ function buildDockerContainer(opts, callback) {
     }
 }
 
+
+/**
+ * Fetch a file's contents from within a docker container (using 'docker cp').
+ *
+ * @param {Object} opts
+ *      opts.dockerHttpClient - A restify HTTP client.
+ *      opts.path - The absolute file path inside the container.
+ *      opts.vmId - The container's id.
+ * @param {Function} callback (err, fileContents)
+ */
+function getFileContentFromContainer(opts, callback) {
+    assert.object(opts, 'opts');
+    assert.object(opts.dockerHttpClient, 'opts.dockerHttpClient');
+    assert.string(opts.path, 'opts.path');
+    assert.string(opts.vmId, 'opts.vmId');
+    assert.func(callback, 'callback');
+
+    var dockerHttpClient = opts.dockerHttpClient;
+    var log = dockerHttpClient.log;
+    var urlPath = fmt('/containers/%s/archive?path=%s', opts.vmId,
+        querystring.escape(opts.path));
+
+    dockerHttpClient.get(urlPath, function onget(connectErr, req) {
+        if (connectErr) {
+            log.error({err: connectErr}, 'getFileFromContainer: connect err');
+            callback(connectErr);
+            return;
+        }
+
+        req.on('result', function onResponse(err, res) {
+            if (err) {
+                log.error({err: err}, 'getFileFromContainer: response err');
+                callback(err);
+                return;
+            }
+
+            var contents = '';
+            var tarExtracter = tar.extract();
+
+            tarExtracter.on('entry', function _tarEntry(header, stream, next) {
+                stream.on('data', function (data) {
+                    contents += data.toString();
+                });
+                stream.on('error', function _tarStreamError(streamErr) {
+                    log.error({err: streamErr},
+                        'getFileFromContainer: stream err');
+                    next(streamErr);
+                });
+                stream.on('end', function _tarStreamEnd() {
+                    next(); // ready for next tar file entry
+                });
+                stream.resume(); // start reading
+            });
+
+            tarExtracter.on('error', function _tarError(tarErr) {
+                log.error({err: tarErr}, 'getFileFromContainer: tar err');
+                callback(tarErr);
+            });
+
+            tarExtracter.on('finish', function _tarFinish() {
+                callback(null, contents);
+            });
+
+            res.pipe(tarExtracter);
+        });
+    });
+}
+
+
 /**
  * Ensure the given image has been pulled, and if not then pull it down.
  */
@@ -1376,6 +1519,16 @@ function ensureImage(opts, callback) {
 
     var log;
     var name = opts.name;
+
+    // Check if the name includes a tag or digest.
+    try {
+        var rat = drc.parseRepoAndRef(name);
+    } catch (e) {
+        callback(new Error(fmt('Failed to parse image name %s: %s', name, e)));
+        return;
+    }
+
+    var encodedName = encodeURIComponent(rat.localName);
 
     vasync.pipeline({ arg: {}, funcs: [
         function getJsonClient(ctx, next) {
@@ -1419,8 +1572,10 @@ function ensureImage(opts, callback) {
         // Image doesn't exist... pull it down.
         function pullImage(ctx, next) {
             log.debug({name: name}, 'ensureImage: pulling image');
-            var url = '/images/create?fromImage='
-                + encodeURIComponent(name);
+            var url = '/images/create?fromImage=' + encodedName;
+            if (rat.tag || rat.digest) {
+                url += '&tag=' + encodeURIComponent(rat.tag || rat.digest);
+            }
             ctx.httpClient.post(url, function _onPost(err, req) {
                 if (err) {
                     next(err);
@@ -1488,11 +1643,34 @@ function ensureImage(opts, callback) {
 
 
 /**
- * Create a nginx VM fixture
+ * Create a docker container.
+ *
+ * @param opts.dockerClient {Object} A docker client.
+ * @param opts.vmapiClient {Object} A vmapi client.
+ * @param opts.test {Object} The tape test object.
+ * @param opts.imageName {String} Optional image name to base the container on.
+ *        Defaults to nginx container.
+ * @param opts.start {Boolean} Optional. Use to start container after creation.
+ *
+ * @returns callback(err, result) Result contains these fields:
+ *          - id: The id of the created container.
+ *          - inspect: The docker inspect result for the container.
+ *          - uuid: The vm uuid for the container.
+ *          - vm: The vmobj for the container.
  */
 function createDockerContainer(opts, callback) {
     assert.object(opts, 'opts');
+    assert.optionalString(opts.apiVersion, 'opts.apiVersion');
+    assert.object(opts.dockerClient, 'opts.dockerClient');
+    assert.optionalObject(opts.extra, 'opts.extra');
+    assert.optionalString(opts.imageName, 'opts.imageName');
+    assert.optionalBool(opts.start, 'opts.start');
+    assert.object(opts.test, 'opts.test');
+    assert.object(opts.vmapiClient, 'opts.vmapiClient');
+    assert.optionalBool(opts.wait, 'opts.wait');
     assert.func(callback, 'callback');
+
+    var imageName = opts.imageName || 'nginx:latest';
 
     var payload = {
         'Hostname': '',
@@ -1512,7 +1690,7 @@ function createDockerContainer(opts, callback) {
         'StdinOnce': false,
         'Env': [],
         'Cmd': null,
-        'Image': 'nginx',
+        'Image': imageName,
         'Volumes': {},
         'WorkingDir': '',
         'Entrypoint': null,
@@ -1565,10 +1743,10 @@ function createDockerContainer(opts, callback) {
 
     vasync.waterfall([
         function (next) {
-            // There is a dependency here, in order to create a nginx container,
-            // the nginx image must first be downloaded.
+            // There is a dependency here, in order to create a container, its
+            // image must first be downloaded.
             ensureImage({
-                name: 'nginx:latest',
+                name: imageName,
                 user: dockerClient.user
             }, next);
         },
@@ -1602,6 +1780,30 @@ function createDockerContainer(opts, callback) {
                 next(err);
             }
         },
+        function attachToContainer(next) {
+            if (!opts.start || !opts.wait) {
+                next();
+                return;
+            }
+
+            dockerClient.post('/containers/' + response.id + '/attach',
+                function onAttach(err, res, req, body) {
+                    t.error(err);
+                    next(err);
+                });
+        },
+        function waitForContainer(next) {
+            if (!opts.start || !opts.wait) {
+                next();
+                return;
+            }
+
+            dockerClient.post('/containers/' + response.id + '/wait',
+                function onWait(err, res, req, body) {
+                    t.error(err);
+                    next(err);
+                });
+        },
         function (next) {
             // Attempt to get container json (i.e. docker inspect).
             dockerClient.get(
@@ -1630,7 +1832,6 @@ function createDockerContainer(opts, callback) {
         callback(err, response);
     });
 }
-
 
 function listContainers(opts, callback) {
     assert.object(opts, 'opts');
@@ -1794,6 +1995,30 @@ function getOrCreateFabricVLAN(client, userUuid, fabricParams, callback) {
 }
 
 /*
+ * Gets or creates an external network for use in testing; based on the
+ * network *name*.
+ */
+function getOrCreateExternalNetwork(client, params, callback) {
+    assert.object(client, 'napi client');
+    assert.object(params, 'network params');
+
+    var listParams = {
+        name: params.name
+    };
+    client.listNetworks(listParams,
+        function (err, networks) {
+            if (err) {
+                return callback(err);
+            }
+            if (networks.length !== 0) {
+                return callback(null, networks[0]);
+            }
+            client.createNetwork(params, callback);
+        }
+    );
+}
+
+/*
  * Gets or creates a fabric network for use in testing; based on the
  * network *name*.
  */
@@ -1818,6 +2043,91 @@ function getOrCreateFabricNetwork(client, userUuid, vlan_id, params, callback) {
         }
     );
 }
+
+/*
+ * Gets or creates a network pool for use in testing; based on the
+ * network *name*.
+ */
+function getOrCreateNetworkPool(client, name, params, callback) {
+    assert.object(client, 'napi client');
+    assert.object(params, 'network params');
+
+    var listParams = {
+        name: name
+    };
+    client.listNetworkPools(listParams, function (err, networks) {
+        if (err) {
+            return callback(err);
+        }
+        if (networks.length !== 0) {
+            return callback(null, networks[0]);
+        }
+        client.createNetworkPool(name, params, callback);
+    });
+}
+
+function getNetwork(client, params, callback) {
+    assert.object(client, 'napi client');
+    assert.object(params, 'network params');
+
+    client.listNetworks(params, function (err, networks) {
+        if (err) {
+            return callback(err);
+        }
+        if (networks.length !== 0) {
+            return callback(null, networks[0]);
+        }
+        callback(new Error('Network not found'));
+    });
+}
+
+function getNicsByVm(client, vm, callback) {
+    assert.object(client, 'napi client');
+    assert.object(vm, 'vm');
+
+    var listParams = { belongs_to_uuid: vm.uuid };
+    client.listNics(listParams, function (err, nics) {
+        if (err) {
+            return callback(err);
+        }
+        if (nics.length !== 0) {
+            return callback(null, nics);
+        }
+        callback(new Error('No Nics found for VM ' + vm.uuid));
+    });
+}
+
+
+/**
+ * Check if fabric networking is enabled.
+ *
+ * @param {Function} callback (err, enabled)
+ */
+function isFabricNetworkingEnabled(client, account, callback) {
+    assert.object(client, 'napi client');
+    assert.object(client, 'user account');
+    assert.func(callback, 'callback function');
+
+    if (FABRICS_ENABLED !== null) {
+        setImmediate(callback, null, FABRICS_ENABLED);
+        return;
+    }
+    client.listFabricVLANs(account.uuid, {}, {},
+        function (err, vlans) {
+            if (err) {
+                if (err.restCode !== 'PreconditionRequiredError') {
+                    callback(err);
+                    return;
+                }
+                FABRICS_ENABLED = false;
+            } else {
+                FABRICS_ENABLED = true;
+            }
+            callback(null, FABRICS_ENABLED);
+        }
+    );
+}
+
 
 /*
  * Return the array of active packages in sorted (smallest to largest) order.
@@ -1864,23 +2174,85 @@ function getSortedPackages(callback) {
 }
 
 
+function createMorayClient(callback) {
+    var log = mod_log;
+    var sdcDockerConfig = configLoader.loadConfigSync({log: log});
+
+    var morayConfig = {
+        host: sdcDockerConfig.moray.host,
+        noCache: true,
+        port: sdcDockerConfig.moray.port,
+        reconnect: true,
+        dns: {
+            resolvers: [sdcDockerConfig.binder.domain]
+        }
+    };
+
+    log.debug(morayConfig, 'Creating moray client');
+    morayConfig.log = log.child({
+        component: 'moray',
+        level: 'warn'
+    });
+    var client = moray.createClient(morayConfig);
+
+    function onMorayConnect() {
+        client.removeListener('error', onMorayError);
+        client.log.info('moray: connected');
+        callback(null, client);
+    }
+
+    function onMorayError(err) {
+        client.removeListener('connect', onMorayConnect);
+        client.log.error(err, 'moray: connection failed');
+        callback(err);
+    }
+
+    client.once('connect', onMorayConnect);
+    client.once('error', onMorayError);
+
+    return client;
+}
+
+
+function createImgapiClient(callback) {
+    var sdcDockerConfig = configLoader.loadConfigSync({log: mod_log});
+
+    var client = new sdcClients.IMGAPI({
+        agent: false,
+        log: mod_log,
+        url: sdcDockerConfig.imgapi.url,
+        userAgent: UA
+    });
+    callback(null, client);
+}
+
+
 // --- exports
 
 module.exports = {
     createDockerRemoteClient: createDockerRemoteClient,
+    createImgapiClient: createImgapiClient,
+    createMorayClient: createMorayClient,
     createSapiClient: createSapiClient,
     createFwapiClient: createFwapiClient,
     createPapiClient: createPapiClient,
     createVmapiClient: createVmapiClient,
     createNapiClient: createNapiClient,
+    createVolapiClient: createVolapiClient,
     dockerIdToUuid: sdcCommon.dockerIdToUuid,
     ensureImage: ensureImage,
     initDockerEnv: initDockerEnv,
     listContainers: listContainers,
     createDockerContainer: createDockerContainer,
     buildDockerContainer: buildDockerContainer,
+    getFileContentFromContainer: getFileContentFromContainer,
+    getOrCreateExternalNetwork: getOrCreateExternalNetwork,
     getOrCreateFabricVLAN: getOrCreateFabricVLAN,
     getOrCreateFabricNetwork: getOrCreateFabricNetwork,
+    getOrCreateNetworkPool: getOrCreateNetworkPool,
+    getNetwork: getNetwork,
+    getNicsByVm: getNicsByVm,
+    isFabricNetworkingEnabled: isFabricNetworkingEnabled,
     getSortedPackages: getSortedPackages,
 
     getDockerEnv: getDockerEnv,
